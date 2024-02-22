@@ -1,0 +1,10 @@
+We provide the target initiation scripts here; after the file system mounted, users can run ANY applications they want.
+
+Remember: 
+1. The default mount point is `/mnt/zapraid_mount/`. Remember to modify the scripts if you want to change to other mount points.
+2. The default user name is `jhli`. Also modify it if you want to change.
+
+Steps:
+1. run `0_periodic_start.sh` to start the target with a infinite loop to keep the target running. 
+2. run `1_start_nvmf.sh` to connect to the first target.
+3. run `run_exp11-12.sh` to start the experiments.
