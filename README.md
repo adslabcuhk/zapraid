@@ -3,7 +3,7 @@
 ## What's Inside
 * `zapraid_prototype`, storing the prototype itself, implemented with C++
 * `mysql`, the folder prepared for TPCC workload in MySQL
-* `scripts`, storing neccessary scripts for running all the experiments
+* `scripts`, the scripts to install the prototype and SPDK 
 * `patches`, storing our modifications to SPDK and FEMU
 
 ## Building Guide
