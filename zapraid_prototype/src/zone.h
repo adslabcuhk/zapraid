@@ -15,6 +15,10 @@ public:
 
   Device* GetDevice();
   uint32_t GetDeviceId();
+  uint32_t GetIssuedPos();
+  bool WillBeFull(); // Check mOffset
+  bool IsFull(); // Check mPos
+  bool NoOngoingWrites();
   uint32_t GetPos();
   void AdvancePos();
   void AdvancePos(uint32_t inc);
@@ -29,6 +33,7 @@ private:
   uint64_t mSlba; // in blocks
   uint32_t mCapacity; // in blocks
   uint32_t mSize;
-  uint32_t mPos; // in blocks
+  uint32_t mPos; // in blocks, the finished offset
+  uint32_t mOffset; // in blocks, the issued offset
 };
 #endif

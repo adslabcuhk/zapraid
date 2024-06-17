@@ -941,9 +941,7 @@ void RAIDController::Init(bool need_env)
     bool flag = i < mNumOpenSegments ? 
       (Configuration::GetStripeGroupSize(i) == 1) : 
       (Configuration::GetStripeGroupSize(mNumOpenSegments - 1) == 1);
-//      mStripeWriteContextPools[i] = new StripeWriteContextPool(16, mRequestContextPoolForSegments);
     if (Configuration::GetSystemMode() == ZONEWRITE_ONLY || 
-        Configuration::GetSystemMode() == RAIZN_SIMPLE || 
         (Configuration::GetSystemMode() == ZAPRAID && flag))
     {
 //      mStripeWriteContextPools[i] = new StripeWriteContextPool(1, mRequestContextPoolForSegments);
@@ -951,6 +949,10 @@ void RAIDController::Init(bool need_env)
       mStripeWriteContextPools[i] = new StripeWriteContextPool(3, mRequestContextPoolForSegments);
       printf("create segment for zone write (i=%d)\n", i);
       // a large value causes zone-writes to be slow
+    } else if (Configuration::GetSystemMode() == RAIZN_SIMPLE) {
+      // for RAIZN, each segment only allows one ongoing write 
+      mStripeWriteContextPools[i] = new StripeWriteContextPool(1, mRequestContextPoolForSegments);
+//      mStripeWriteContextPools[i] = new StripeWriteContextPool(3, mRequestContextPoolForSegments);
     } else {
       uint32_t index = i;
       if (index >= mNumOpenSegments) {
@@ -964,9 +966,13 @@ void RAIDController::Init(bool need_env)
   }
 
   mOpenSegments.resize(mNumOpenSegments);
+  if (Configuration::GetSystemMode() == RAIZN_SIMPLE) {
+    mNumOpenSegmentsThres--;
+  }
 
   debug_error("reboot mode %d\n", Configuration::GetRebootMode());
   if (Configuration::GetRebootMode() == 0) {
+    debug_warn("devices size = %lu\n", mDevices.size());
     for (uint32_t i = 0; i < mN; ++i) {
       debug_warn("Erase device %u\n", i);
       mDevices[i]->EraseWholeDevice();
@@ -1273,7 +1279,7 @@ IndexMapStatus RAIDController::UpdateIndex(uint64_t lba, PhysicalAddr pba)
     }
     assert(oldPba.zoneId < mN);
     assert(oldPba.offset >= mHeaderRegionSize); 
-    assert(oldPba.offset < mHeaderRegionSize + mDataRegionSize); 
+    assert(oldPba.offset < mHeaderRegionSize + mDataRegionSize);  // if the chunk size is not aligned (e.g., 24KiB), will cause the error
   }
 
   if (oldPba.segment != nullptr && !(oldPba == pba)) {
@@ -1689,6 +1695,10 @@ std::queue<RequestContext*>& RAIDController::GetReadIndexQueue()
 // not for GC, but for normal writes
 void RAIDController::WriteInDispatchThread(RequestContext *ctx)
 {
+  static struct timeval tv1, tv2;
+  static int cnt = 0;
+  if (cnt == 0) tv1.tv_sec = 0, cnt = 1;
+
   // if using mapping blocks, need to reserve one more segment.
   if (mAvailableStorageSpaceInSegments <= 1 + (!mAddressMap->IsAllInMemory())) {
     if (!Configuration::GetEnableGc()) {
@@ -1705,7 +1715,7 @@ void RAIDController::WriteInDispatchThread(RequestContext *ctx)
 //            ctx->lba, ctx->size);
       }
       // continue. Find an available segment
-    } 
+    }
 
     if (ctx->type != INDEX) {
       return;
@@ -1752,6 +1762,11 @@ void RAIDController::WriteInDispatchThread(RequestContext *ctx)
 
       // can not append in two cases: (1) full; (2) state transition
       success_bytes = mOpenSegments[openGroupId]->BufferedAppend(ctx, pos, left);
+//      gettimeofday(&tv2, 0);
+//      if (tv2.tv_sec > tv1.tv_sec + 5) {
+//        tv1 = tv2;
+//        debug_error("return success bytes 0, pos %u left %u\n", pos, left);
+//      }
       mSpIdWriteSizes[openGroupId] += success_bytes;
       if (success_bytes == 0) {
         debug_info("success_bytes: %u\n", success_bytes);
@@ -2320,15 +2335,31 @@ void RAIDController::createSegmentIfNeeded(Segment **segment, uint32_t spId)
   }
 
   if (Configuration::GetSystemMode() == RAIZN_SIMPLE) {
+    // initialization for RAIZN data structures
+    if (mMetazones.size() < mN) {
+      mMetazones.resize(mN);
+    }
+    if (mResetMetaZoneContexts.size() < mN) {
+      mResetMetaZoneContexts.resize(mN);
+    }
+
     // add meta zone for each device
-    for (uint32_t i = 0; i < mN; ++i) { 
-      Zone* zone = mDevices[i]->OpenZone();
-      if (zone == nullptr) {
-        printf("No available zone in device %d, storage space is exhuasted!\n", i);
-        assert(0);
+    for (uint32_t devId = 0; devId < mN; ++devId) { 
+      Zone* zone;
+      debug_warn("devId %u size %lu\n", devId, mMetazones[devId].size());
+      while (mMetazones[devId].size() < 2) {
+        zone = mDevices[devId]->OpenZone();
+        if (zone == nullptr) {
+          printf("No available zone in device %d, storage space is exhuasted!\n", devId);
+          assert(0);
+        }
+        mMetazones[devId].push_back(zone);
       }
-      debug_warn("add meta zone %p\n", zone); 
-      seg->AddMetaZone(zone);
+      for (auto& it : mMetazones[devId]) {
+        zone = it; // mMetazones[devId].front();
+        assert(zone != nullptr);
+        seg->PushBackMetaZone(zone, devId);
+      }
     }
   }
 
@@ -2666,6 +2697,105 @@ bool RAIDController::CheckSegments()
     }
   }
 
+  if (Configuration::GetSystemMode() == RAIZN_SIMPLE) {
+    // check whether the metadata zones will be full. If so, reset
+    if (mMetazones.size() < mN) {
+      // not initialized
+      return stateChanged;
+    }
+    bool printed = false;
+    for (int devId = 0; devId < mN; devId++) {
+      if (mMetazones[devId].empty()) continue;
+      Zone* zone = mMetazones[devId].front();
+      if (zone->WillBeFull()) { // remove the meta zone from all segments
+        // open a new meta zone
+        Zone* newZone = mDevices[devId]->OpenZone();
+        if (newZone == nullptr) {
+          printf("No available zone in device %d, storage space"
+            "is exhuasted!\n", devId);
+          assert(0);
+        }
+        mMetazones[devId].push_back(newZone);
+
+        // remove the full meta zone, and insert the new meta zone
+        for (int i = 0; i < mOpenSegments.size(); ++i) {
+          if (mOpenSegments[i] == nullptr) {
+            continue;
+          }
+          int ret = mOpenSegments[i]->PopFrontMetaZone(zone, devId);
+          // ret is probably zero, because it may be removed in Segment
+          if (ret) {
+//            printf("pop %p meta zone from segment id %d devId %d\n",
+//              zone, i, devId);
+            if (!printed && devId == 0) {
+              debug_error("pop %p meta zone from segment id %d devId %d\n",
+                  zone, i, devId);
+              printed = true;
+            }
+          }
+          mOpenSegments[i]->PushBackMetaZone(newZone, devId);
+        }
+
+        // move to the writing queue
+        mMetazones[devId].pop_front();
+        // we assume that each device only have one full meta zone
+        assert(!mWritingMetaZones.count(devId));
+        mWritingMetaZones[devId] = zone;
+      }
+    }
+
+    // check zones that will be full. Reset if necessary.
+    auto& mp = mWritingMetaZones;
+    std::set<int> devsTmp;
+    for (auto it = mp.begin(); it != mp.end(); ++it) {
+      int devId = it->first;
+      Zone *zone = it->second;
+      if (!zone->NoOngoingWrites()) {
+        continue;
+      }
+
+      // reset the zone
+      // not good to call here;
+      RequestContext *resetCtx = &mResetMetaZoneContexts[devId];
+      resetCtx->Clear();
+      resetCtx->ctrl = this;
+      resetCtx->segment = nullptr;  // TODO not good
+      resetCtx->type = STRIPE_UNIT; // TODO not good
+      resetCtx->status = RESET_REAPING;
+      resetCtx->available = false;
+      zone->Reset(resetCtx);
+
+      // move to the reset queue
+//      mWritingMetaZones.erase(devId);
+      devsTmp.insert(devId);
+      assert(!mResettingMetaZones.count(devId));
+      mResettingMetaZones[devId] = zone;
+    }
+
+    for (auto it : devsTmp) {
+      mWritingMetaZones.erase(it);
+    }
+    devsTmp.clear();
+
+    // check zones that are reseting.
+    auto& mp2 = mResettingMetaZones;
+    for (auto it = mp2.begin(); it != mp2.end(); ++it) {
+      int devId = it->first;
+      Zone* zone = it->second;
+      if (mResetMetaZoneContexts[devId].available) {
+        // reset finished
+//        mp2.erase(devId);
+        devsTmp.insert(devId);
+        mDevices[devId]->ReturnZone(zone);
+      }
+    }
+
+    for (auto it : devsTmp) {
+      mResettingMetaZones.erase(it);
+    }
+    devsTmp.clear();
+  }
+
   return stateChanged;
 }
 
@@ -2835,6 +2965,7 @@ void RAIDController::GenerateSegmentWriteOrder(uint32_t size, int* res, int& res
   res_id = 0;
   // find the matched segments
   auto thres = Configuration::GetLargeRequestThreshold();
+
   for (int i = 0; i < mNumOpenSegments; i++) {
     if (mOpenSegments[i] == nullptr) {
       continue;
@@ -2845,7 +2976,13 @@ void RAIDController::GenerateSegmentWriteOrder(uint32_t size, int* res, int& res
     // accelerate: directly return for in-flight stripes
     if (mOpenSegments[i]->HasInFlightStripe()) {
       res[res_id++] = i;
-      return;
+      // need to check other segments for RAIZN because a segment with
+      // in-flight stripe may wait
+      if (Configuration::GetSystemMode() != RAIZN_SIMPLE) {
+        return;
+      } else {
+        continue;
+      }
     }
 
     if (mOpenSegments[i]->isUsingAppend()) {

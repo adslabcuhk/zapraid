@@ -14,9 +14,11 @@ void Zone::Init(Device* device, uint64_t slba, uint64_t capacity, uint64_t size)
   mSlba = slba;
   mCapacity = capacity;
   mSize = size;
-  mPos = 0;
+  mOffset = 0; // the in-zone offset of issued I/O requests
+  mPos = 0;    // the in-zone offset of finished I/O requests
 }
 
+// size: in bytes
 void Zone::Write(uint32_t offset, uint32_t size, void *ctx)
 {
   RequestContext *reqCtx = (RequestContext*)ctx;
@@ -28,6 +30,7 @@ void Zone::Write(uint32_t offset, uint32_t size, void *ctx)
     reqCtx->offset = offset;
     mDevice->Write(offset2Bytes(offset), size, ctx);
   }
+  mOffset += size / Configuration::GetBlockSize();
 }
 
 void Zone::Read(uint32_t offset, uint32_t size, void *ctx)
@@ -37,6 +40,7 @@ void Zone::Read(uint32_t offset, uint32_t size, void *ctx)
 
 void Zone::Reset(void *ctx)
 {
+  mOffset = 0;
   mPos = 0;
   mDevice->ResetZone(this, ctx);
 }
@@ -56,9 +60,25 @@ uint32_t Zone::GetDeviceId()
   return mDevice->GetDeviceId();
 }
 
+uint32_t Zone::GetIssuedPos() {
+  return mOffset;
+}
+
+bool Zone::WillBeFull() {
+  return (mOffset + 32 >= mCapacity);  // reserve 32 blocks
+}
+
 uint32_t Zone::GetPos()
 {
   return mPos;
+}
+
+bool Zone::IsFull() {
+  return (mPos >= mCapacity);
+}
+
+bool Zone::NoOngoingWrites() {
+  return mOffset == mPos;
 }
 
 void Zone::AdvancePos()

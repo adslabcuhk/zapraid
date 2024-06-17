@@ -13,7 +13,6 @@ class RAIDController;
 struct SegmentMetadata {
   uint64_t segmentId; // 8
   uint64_t zones[16]; // 128
-  uint64_t metazones[16]; // 128
   uint32_t stripeSize; // 16384
   uint32_t stripeDataSize; // 12288 
   uint32_t stripeParitySize; // 4096
@@ -35,8 +34,6 @@ enum SegmentStatus {
   SEGMENT_WRITING_FOOTER,
   SEGMENT_SEALING,
   SEGMENT_SEALED,
-  SEGMENT_METAZONE_PREPARE_RESET,
-  SEGMENT_METAZONE_RESETTING
 };
 
 enum AppendStatus {
@@ -65,7 +62,15 @@ public:
    */
   void AddZone(Zone *zone);
 
-  void AddMetaZone(Zone *zone);
+  void PushBackMetaZone(Zone *zone, int devId);
+
+  /**
+   * Remove a meta zone because the meta zone will be full. 
+   * @return 1 if the meta zone is popped successfully (zone matched)
+   */
+  uint32_t PopFrontMetaZone(Zone *zone, int devId);
+
+  void CleanStripeContext(StripeWriteContext* stripe);
 
   /**
    * @brief Finalize the new segment creation
@@ -143,11 +148,6 @@ public:
    */
   void Reset(RequestContext *ctx);
 
-  /**
-   * @brief Reset all the meta zones in the segment 
-   */
-  void ResetMetaZones();
-
   bool IsResetDone();
 
   /**
@@ -182,6 +182,7 @@ public:
 
   void WriteComplete(RequestContext *ctx);
   void ReadComplete(RequestContext *ctx);
+  void RaiznWriteComplete();
 
   void InvalidateBlock(uint32_t zoneId, uint32_t realOffset);
   void FinishBlock(uint32_t zoneId, uint32_t realOffset, uint64_t lba);
@@ -273,7 +274,6 @@ private:
   CodedBlockMetadata *mCodedBlockMetadata;
 
   std::vector<Zone*> mZones;
-  std::vector<Zone*> mMetaZones;
   std::vector<RequestContext> mResetContext;
 
   // position in **number of blocks**
@@ -336,9 +336,11 @@ private:
 
   // for raizn, write the metadata zone
   // meta zone positions
-  uint32_t mMetaZonePos[16];
-  uint32_t mMetaZoneResets; 
-  uint32_t mOngoingMetaWrites = 0;
+  std::vector<std::list<Zone*>> mMetaZoneList;
+  int mOngoingRaiznWrites = 0;
+  // debug for raizn
+  uint64_t totalMetaWrites = 0;
+  uint64_t totalStripeWrites = 0;
 };
 
 #endif

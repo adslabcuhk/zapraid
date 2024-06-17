@@ -289,14 +289,12 @@ static void handleStripeUnitContext(RequestContext *context)
         StripeWriteContext *stripe = context->associatedStripe;
         debug_warn("stripe %p\n", stripe);
         if (stripe != nullptr) {
+          Segment* seg = nullptr;
           stripe->successBytes += context->ioContext.size * blockSize;
           if (Configuration::GetEnableIOLatencyTest() && 
               context->successBytes == Configuration::GetStripeUnitSize(0)) {
             ctrl->MarkWriteLatency(context);
           }
-
-          // TODO add raizn check. maybe. (targetBytes of stripe will be
-          // changed in segment.cc)
 
           if (stripe->successBytes > stripe->targetBytes +
               stripe->metaTargetBytes) {
@@ -307,21 +305,24 @@ static void handleStripeUnitContext(RequestContext *context)
             assert(0);
           }
 
+          debug_warn("stripe->successBytes %u stripe->targetBytes %u"
+              " stripe->metaTargetBytes %u\n",
+              stripe->successBytes, stripe->targetBytes,
+              stripe->metaTargetBytes);
           if (stripe->successBytes != stripe->targetBytes + 
               stripe->metaTargetBytes) {
-            debug_warn("stripe->successBytes %u stripe->targetBytes %u"
-                " stripe->metaTargetBytes %u\n",
-                stripe->successBytes, stripe->targetBytes,
-                stripe->metaTargetBytes);
             break;
           }
 
-          debug_warn("stripe complete: targetBytes %u metaTargetBytes %u\n",
-              stripe->targetBytes, stripe->metaTargetBytes);
-
-          // Acknowledge the completion only after the whole stripe persists
-          // update pba array
+          // Acknowledge the completion only after the whole or partial stripe
+          // persists
+          // update pba array through handleContext(parent)
           for (auto slot : stripe->ioContext) {
+            if (slot->available) continue;
+            if (slot->successBytes < slot->targetBytes) {
+              // not used because RAIZN allows the following units to wait 
+              continue;  
+            }
             uint32_t totalContextSize = slot->ioOffset * blockSize;
             for (auto reqSizeIt_ : slot->associatedRequests) {
               RequestContext *parent = reqSizeIt_.first;
@@ -348,7 +349,7 @@ static void handleStripeUnitContext(RequestContext *context)
                 }
                 assert(parent->successBytes <= parent->targetBytes);
                 if (contextReady(parent)) {
-                  debug_warn("handle %p\n", parent);
+                  debug_warn("handle parent %p\n", parent);
                   handleContext(parent);
                 }
               }
@@ -360,16 +361,21 @@ static void handleStripeUnitContext(RequestContext *context)
 
             slot->segment->WriteComplete(slot);
             status = WRITE_COMPLETE;
-            if (stripe->successBytes > stripe->totalTargetBytes + stripe->metaTargetBytes) {
-              debug_error("stripe->successBytes %u stripe->totalTargetBytes %u\n",
-                  stripe->successBytes, stripe->totalTargetBytes);
-              assert(0);
-            }
 
             // cannot reclaim the slot if only partial stripe is written
-            if (stripe->successBytes == stripe->totalTargetBytes + stripe->metaTargetBytes) {
               slot->available = true;
+
+            if (slot->segment != nullptr) {
+              if (seg == nullptr) {
+                seg = slot->segment;
+              } else {
+                assert(seg == slot->segment);
+              }
             }
+          }
+
+          if (Configuration::GetSystemMode() == RAIZN_SIMPLE) {
+            seg->RaiznWriteComplete();
           }
         }
       } else {
@@ -617,6 +623,7 @@ int handleBackgroundTasks(void *args) {
           // I/O not processing, but some requests needs to be processed 
           printf("[DEBUG] totally stuck\n");
           Configuration::SetStuckDebugMode(timeNow);
+          assert(0);
         } else {
         }
 
@@ -634,7 +641,7 @@ int handleBackgroundTasks(void *args) {
 
   bool hasProgress = false;
   hasProgress |= raidController->ProceedGc();
-  hasProgress |= raidController->CheckSegments();
+  hasProgress |= raidController->CheckSegments(); // including meta zones
   gettimeofday(&e, 0);
   raidController->MarkDispatchThreadBackgroundTime(s, e);
 
@@ -882,6 +889,10 @@ void zoneWrite2(void *arg1, void *arg2)
   }
 
   gettimeofday(&e, 0);
+  if (slot->ctrl == nullptr) {
+    debug_warn("slot nullptr %p\n", slot);
+    assert(0); 
+  }
   slot->ctrl->MarkIoThreadZoneWriteTime(s, e);
 }
 

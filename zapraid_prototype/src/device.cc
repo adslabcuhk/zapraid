@@ -38,11 +38,17 @@ static void writeComplete(void *arg, const struct spdk_nvme_cpl *completion)
   debug_warn("write complete %d slot %p offset %u size %u slot->zone->pos %u\n",
       slot->successBytes, slot, slot->offset, slot->size, slot->zone->GetPos());
   if (slot->status != WRITE_REAPING) {
-    debug_error("slot %p status %d\n", slot, slot->status);
+    debug_error("slot %p status %d success %u zone %p curOffset %u offset %u\n", slot,
+        slot->status, slot->successBytes, slot->zone, slot->curOffset, slot->offset);
   }
   assert(slot->status == WRITE_REAPING);
   debug_w("queue");
   gettimeofday(&e, 0);
+  if (slot->ctrl == nullptr) {
+    debug_error("write complete %d slot %p offset %u size %u slot->zone->pos %u\n",
+        slot->successBytes, slot, slot->offset, slot->size, slot->zone->GetPos());
+    assert(0);
+  }
   slot->ctrl->MarkIoThreadZoneWriteCompleteTime(s, e);
   slot->Queue();
 };

@@ -114,6 +114,10 @@ void Segment::initSegment(RAIDController *raidController,
     }
   }
 
+  if (Configuration::GetSystemMode() == RAIZN_SIMPLE) {
+    mMetaZoneList.resize(n);
+  }
+
   mCodedBlockMetadata = new CodedBlockMetadata[mSegmentMeta.n * mDataRegionSize];
   memset(mCodedBlockMetadata, 0, mSegmentMeta.n * mDataRegionSize *
       sizeof(CodedBlockMetadata));
@@ -149,13 +153,39 @@ void Segment::AddZone(Zone *zone)
   mZones.emplace_back(zone);
 }
 
-void Segment::AddMetaZone(Zone *zone)
-{
-  if (Configuration::GetSystemMode() != RAIZN_SIMPLE) 
-    return;
-  mSegmentMeta.metazones[mMetaZones.size()] = zone->GetSlba();
-  mMetaZonePos[mMetaZones.size()] = 0;
-  mMetaZones.emplace_back(zone);
+// must be called in the dispatch thread
+void Segment::PushBackMetaZone(Zone *zone, int devId) {
+  if (Configuration::GetSystemMode() != RAIZN_SIMPLE) {
+    assert(0);
+  }
+  assert(devId < mMetaZoneList.size());
+  mMetaZoneList[devId].push_back(zone);
+  debug_warn("list dev %d size %lu zone %p \n", devId, mMetaZoneList[devId].size(), zone);
+}
+
+// must be called in the dispatch thread
+uint32_t Segment::PopFrontMetaZone(Zone *zone, int devId) {
+  if (Configuration::GetSystemMode() != RAIZN_SIMPLE) {
+    assert(0);
+  }
+  assert(devId < mMetaZoneList.size());
+  assert(!mMetaZoneList[devId].empty());
+  Zone* z = mMetaZoneList[devId].front();
+  if (z == zone) {
+    mMetaZoneList[devId].pop_front();
+  }
+//  if (devId == 0) {
+//    debug_error("list dev %d size %lu zone Pos %u\n", devId,
+//        mMetaZoneList[devId].size(), zone->GetIssuedPos());
+//  }
+  return (z == zone ? 1 : 0);
+}
+
+void Segment::CleanStripeContext(StripeWriteContext *stripe) {
+  for (auto slot : stripe->ioContext) {
+    mRequestContextPool->ReturnRequestContext(slot);
+  }
+  stripe->ioContext.clear();
 }
 
 const std::vector<Zone*>& Segment::GetZones()
@@ -348,32 +378,6 @@ bool Segment::StateTransition()
       }
       mSegmentStatus = SEGMENT_SEALED;
     }
-  } else if (mSegmentStatus == SEGMENT_METAZONE_PREPARE_RESET) {
-    if (mOngoingMetaWrites == 0) {
-      debug_error("segment %lu meta zones prepare reset\n",
-          mSegmentMeta.segmentId);
-      mSegmentStatus = SEGMENT_METAZONE_RESETTING;
-      stateChanged = true;
-      ResetMetaZones();
-    }
-  } else if (mSegmentStatus == SEGMENT_METAZONE_RESETTING) { 
-    bool flag = true;
-    for (int i = 0; i < mSegmentMeta.n; i++) {
-      if (!mResetContext[i].available || mResetContext[i].status != RESET_COMPLETE) {
-        flag = false;
-        break;
-      }
-    }
-    if (flag) {
-      debug_error("segment %lu meta zones reset complete\n",
-          mSegmentMeta.segmentId);
-      for (int i = 0; i < mSegmentMeta.n; i++) {
-        mMetaZonePos[i] = 0;
-      }
-      mSegmentStatus = SEGMENT_NORMAL;
-      stateChanged = true;
-    }
-
   }
 
   return stateChanged;
@@ -381,7 +385,6 @@ bool Segment::StateTransition()
 
 void finalizeSegmentHeader2(void *arg1, void *arg2)
 {
-  debug_w("finalizeSegmentHeader2\n");
   Segment *segment = reinterpret_cast<Segment*>(arg1);
   segment->FinalizeSegmentHeader();
 }
@@ -407,7 +410,6 @@ void Segment::FinalizeCreation()
     RequestContext *slot = mRequestContextPool->GetRequestContext(true);
     stripe->ioContext[i] = slot;
     slot->available = false;
-    debug_warn("start slot %p\n", slot);
   }
 
   if (!Configuration::GetEventFrameworkEnabled()) {
@@ -429,7 +431,6 @@ void Segment::FinalizeSegmentHeader()
 
   for (uint32_t i = 0; i < mSegmentMeta.n; ++i) {
     RequestContext *slot = stripe->ioContext[i];
-    debug_warn("slot %p\n", slot);
     slot->associatedStripe = stripe;
     slot->targetBytes = blockSize * mHeaderRegionSize;
     slot->lba = ~0ull;
@@ -529,15 +530,15 @@ bool Segment::findStripe()
       // Append(): change to mSegmentMeta.stripeSize
       // PartialAppend(): change to mPosInStripe
       mCurStripe->targetBytes = mSegmentMeta.stripeSize;
-      mCurStripe->totalTargetBytes = mSegmentMeta.stripeSize;
+      mCurStripe->totalTargetBytes = mSegmentMeta.stripeSize;  // include meta zones
 
       // to be compatible with raizn
       mCurStripe->metaTargetBytes = 0;
 
       // old: prepare contexts for parity chunks 
-      // new: preapre for all chunks. Modified because RAIZN needs parity updates
-      mCurStripe->ioContext.resize(mSegmentMeta.n);
-      for (int j = 0; j < mSegmentMeta.stripeSize / mSegmentMeta.stripeUnitSize; ++j) {
+      // new: preapre for all chunks. Prepare n+1 chunks because RAIZN needs parity updates
+      mCurStripe->ioContext.resize(mSegmentMeta.n * 2 - mSegmentMeta.k);
+      for (int j = 0; j < mSegmentMeta.n * 2 - mSegmentMeta.k; ++j) {
         RequestContext *context = mRequestContextPool->GetRequestContext(true);
         context->associatedStripe = mCurStripe;
         context->targetBytes = mSegmentMeta.stripeUnitSize;
@@ -546,6 +547,9 @@ bool Segment::findStripe()
         context->segment = this;
 //        mCurStripe->ioContext[mSegmentMeta.k + j] = context;
         mCurStripe->ioContext[j] = context;
+        if (j >= mSegmentMeta.n) {  // contexts for meta zones. Set to available first
+          context->available = true;
+        }
       }
 
       // calculate stripe write latencies
@@ -560,8 +564,6 @@ bool Segment::findStripe()
 
       accept = true;
     }
-  } else {
-//    debug_warn("mSegmentStatus %d\n", mSegmentStatus);
   }
   return accept;
 }
@@ -646,6 +648,7 @@ inline void Segment::writeCSTable(uint32_t index, uint32_t stripeId) {
 // and continue to write.
 uint32_t Segment::BufferedAppend(RequestContext *ctx, uint32_t offset, uint32_t size)
 {
+  static int first = 0, second = 0;
 //  debug_w("start");
   mTimevalBetweenAppend = mTimeval;
   gettimeofday(&mTimeval, 0);
@@ -661,6 +664,16 @@ uint32_t Segment::BufferedAppend(RequestContext *ctx, uint32_t offset, uint32_t 
     debug_error("mPosInStripe %u mPos %u slot %p\n",
         mPosInStripe, mPos, mCurSlot);
   }
+
+  if (!first) {
+    debug_warn("here %d\n", mOngoingRaiznWrites);
+    first = 1;
+  }
+  if (Configuration::GetSystemMode() == RAIZN_SIMPLE &&
+      mOngoingRaiznWrites > 0) {
+    return 0;
+  }
+//  debug_w("here");
 
   if (mPosInStripe == 0 && mCurSlot == nullptr) {
     if (!findStripe()) {
@@ -817,8 +830,9 @@ uint32_t Segment::BufferedAppend(RequestContext *ctx, uint32_t offset, uint32_t 
     ret = 0;
 
     if (Configuration::GetSystemMode() == RAIZN_SIMPLE) {
-      bool hasPpu = (offset * blockSize + uCtxSize == ctx->size);
-      ret = PartialAppend(hasPpu);
+      // the last part for the write, write a PPU
+      bool mayHavePpu = (offset * blockSize + uCtxSize == ctx->size); 
+      ret = PartialAppend(mayHavePpu);
     } else {
       ret = Append();
     }
@@ -831,10 +845,12 @@ uint32_t Segment::BufferedAppend(RequestContext *ctx, uint32_t offset, uint32_t 
       ret = 0;
     }
   } else {
+    debug_warn("slot not full size %u curOffset %u\n", slot->size, slot->curOffset);
     ret = uCtxSize;
     if (Configuration::GetSystemMode() == RAIZN_SIMPLE) {
-      bool hasPpu = (offset * blockSize + uCtxSize == ctx->size);
-      ret = PartialAppend(hasPpu);
+      // the last part for the write, write a PPU
+      bool mayHavePpu = (offset * blockSize + uCtxSize == ctx->size);
+      ret = PartialAppend(mayHavePpu);
       if (ret == slot->size) {
         ret -= originalSize;
       } else {
@@ -956,11 +972,14 @@ uint32_t Segment::Append()
   return mSegmentMeta.stripeUnitSize;
 }
 
-uint32_t Segment::PartialAppend(bool hasPpu)
+uint32_t Segment::PartialAppend(bool mayHavePpu)
 {
+  static struct timeval tv1, tv2;
+  static int cnt = 0;
+  if (cnt == 0) tv1.tv_sec = 0, cnt = 1;
+
   debug_w("start");
-  SystemMode mode = Configuration::GetSystemMode();
-  if (mode != RAIZN_SIMPLE) {
+  if (Configuration::GetSystemMode() != RAIZN_SIMPLE) {
     debug_e("only supported in RAIZN_SIMPLE mode");
     assert(0);
   }
@@ -993,23 +1012,62 @@ uint32_t Segment::PartialAppend(bool hasPpu)
     // start writing from curOffset
     // note that Append() and PartialAppend() do not touch successBytes
     assert(slot->size <= mSegmentMeta.stripeUnitSize);
+//    debug_error("used before? %p %d curOffset %u\n", slot, slot->available, slot->curOffset);
+
+    // reset the variables so that it can be reused
+    slot->available = false; // may be used before, need to set to false again
+    slot->status = WRITE_REAPING;
+
     slot->targetBytes = slot->size;
     uint32_t bytes2append = slot->size - slot->curOffset * blockSize;
-    assert(bytes2append != 0);
     mCurStripe->targetBytes = mPosInStripe + bytes2append;
-    slot->targetBytes = slot->size;
+
+    totalStripeWrites += bytes2append;
+    mPosInStripe += bytes2append;
 
     // a full stripe. Need to change the target bytes to a whole stripe
     if (mCurStripe->targetBytes == mSegmentMeta.stripeDataSize) {
+      totalStripeWrites += mSegmentMeta.stripeSize - mCurStripe->targetBytes;
       mCurStripe->targetBytes = mSegmentMeta.stripeSize;
     } else {
-      // or update metadata in metadata zone
-      mCurStripe->metaTargetBytes += mSegmentMeta.stripeUnitSize;
+      // ... or write a ppu in metadata zone.
+      // We assume that RAIDController will fill the in-flight stripes to
+      // a segment first until creating other in-flight stripes. So it is
+      // impossible that some slots are written to a non-aligned stripe without
+      // a PPU while other slots are written to another non-aligned stripe with
+      // a PPU
+      if (mayHavePpu && mPosInStripe != mSegmentMeta.stripeDataSize) {
+        mCurStripe->metaTargetBytes += mSegmentMeta.stripeUnitSize;
+        totalMetaWrites += mSegmentMeta.stripeUnitSize;
+        // force each user write to finish after a PPU or a parity is written
+      }
+
+      if (mayHavePpu) {
+        // if the slot is the last slot of the user write, need to stop all
+        // following writes to the same segment.
+        // Note that it is OK that a large write whose PPU is written to a
+        // segment while other data is written to another segment, and the
+        // segment with the PPU finish first. In this case, the user write
+        // still needs to wait for another segment to finish the write.
+        mOngoingRaiznWrites++;
+      }
     }
 
     debug_warn("bytes2append %u slot %p zone id %u stripe.target %u metatarget %u\n",
         bytes2append, slot, slot->zoneId, mCurStripe->targetBytes,
         mCurStripe->metaTargetBytes);
+
+    debug_warn("total writes: %lu total meta writes %lu\n",
+        totalStripeWrites, totalMetaWrites);
+
+//    gettimeofday(&tv2, 0);
+//    if (tv2.tv_sec > tv1.tv_sec) {
+//      tv1 = tv2;
+//      debug_error("total writes: %lu total meta writes %lu\n",
+//          totalStripeWrites, totalMetaWrites);
+//    }
+
+    debug_warn("mayHavePpu: %d\n", (int)mayHavePpu);
 
     // asynchronous write
     slot->zone = mZones[slot->zoneId];
@@ -1020,25 +1078,30 @@ uint32_t Segment::PartialAppend(bool hasPpu)
     if (slot->size == mSegmentMeta.stripeUnitSize) {
       mCurSlot = nullptr;
     } 
-
-    mPosInStripe += bytes2append;
   }
 
   do {
-    if (!hasPpu && mPosInStripe != mSegmentMeta.stripeDataSize) {
+    // Check whether to write PPU or a complete parity.
+    if (!mayHavePpu && mPosInStripe != mSegmentMeta.stripeDataSize) {
+      // !mayHavePpu: Do not skip PPU if it is not the final slot of the write
+      // (mayHavePpu: is the final slot of the write)
+      // !=: Do not skip a complete parity if the stripe is not full 
+      // (==: The stripe is full)
       break;
     }
-    // issue parity updates to metadata zone 
-    GenerateParityBlockArgs *args = (GenerateParityBlockArgs*)calloc(1, sizeof(GenerateParityBlockArgs));
+    // issue PPUs to metadata zone, or full parity writes to regular zones 
+    GenerateParityBlockArgs *args = (GenerateParityBlockArgs*)calloc(1,
+        sizeof(GenerateParityBlockArgs));
     args->segment = this;
     args->stripe = mCurStripe;
     args->zonePos = mPos;
     args->stripeId = mCurStripeId;
     args->stripeGenTv = mTimevalStripe; 
-
-    // if whole stripe written, do not use meta zone
-    debug_warn("mPosInStripe %u mSegmentMeta.stripeDataSize %u\n", mPosInStripe, mSegmentMeta.stripeDataSize);
     args->useMetaZone = (mPosInStripe != mSegmentMeta.stripeDataSize);
+
+    debug_warn("prepare parity block %p zonePos %u stripeId %u\n", mCurStripe, mPos, mCurStripeId);
+
+    bool useMetaZone = args->useMetaZone;
 
     if (!Configuration::GetEventFrameworkEnabled()) {
       thread_send_msg(mRaidController->GetEcThread(), generateParityBlock, args);
@@ -1047,7 +1110,7 @@ uint32_t Segment::PartialAppend(bool hasPpu)
     }
 
     // whole stripe written
-    if (!args->useMetaZone) {
+    if (!useMetaZone) {
       mPosInStripe = 0;
       mPos += mSegmentMeta.stripeUnitSize / blockSize;
       mCurStripeId++;
@@ -1099,14 +1162,6 @@ void Segment::GenerateParityBlock(StripeWriteContext *stripe, uint32_t zonePos, 
     EncodeStripe(stripeData, n, k, unitSize);
     EncodeStripe(stripeProtectedMetadata, n, k, Configuration::GetMetadataSize() * 
       unitSize / blockSize); // actual 16 bytes for the protected fields, but encode all
-//    uint32_t zoneId = 0;
-//    for (uint32_t i = 0; i < n; ++i) {
-//      uint32_t diskId = Configuration::CalculateDiskId(
-//          zonePos, i, (RAIDLevel)mSegmentMeta.raidScheme, mSegmentMeta.numZones);
-//      if (diskId == 0) { zoneId = i; }
-////      printf("%u %u %u %lu %lu %u\n", i, diskId, ((BlockMetadata*)stripe->ioContext[i]->meta)->fields.coded.lba, ((BlockMetadata*)stripe->ioContext[i]->meta)->fields.coded.timestamp, ((BlockMetadata*)stripe->ioContext[i]->meta)->fields.replicated.stripeId);
-//    }
-//    printf("%u %lu %lu %u\n", zoneId, ((BlockMetadata*)stripe->ioContext[zoneId]->meta)->fields.coded.lba, ((BlockMetadata*)stripe->ioContext[zoneId]->meta)->fields.coded.timestamp, ((BlockMetadata*)stripe->ioContext[zoneId]->meta)->fields.replicated.stripeId);
   }
 
   for (uint32_t i = k; i < n; ++i) {
@@ -1114,6 +1169,10 @@ void Segment::GenerateParityBlock(StripeWriteContext *stripe, uint32_t zonePos, 
         stripeId, i, mSegmentMeta.raidScheme, mSegmentMeta.numZones  
         /*zonePos, i, (RAIDLevel)mSegmentMeta.raidScheme, mSegmentMeta.numZones*/);
     RequestContext *slot = stripe->ioContext[i];
+    if (useMetaZone) {
+      slot = stripe->ioContext[i - k + n];
+      // TODO copy the parity data from the ioContext[i] to ioContext[i - k + n]
+    }
     slot->lba = ~0ull;
     slot->ctrl = mRaidController;
     slot->segment = this;
@@ -1129,23 +1188,28 @@ void Segment::GenerateParityBlock(StripeWriteContext *stripe, uint32_t zonePos, 
       blkMeta->fields.replicated.stripeId = slot->stripeId;
     }
 
-    // breakdown
     slot->size = unitSize;
     if (useMetaZone) {
-      debug_warn("slot %p i %d zoneId %d\n", slot, i, zoneId);
-      if (mMetaZonePos[zoneId] % 32768 == 0) {
-        debug_error("slot %p i %d zoneId %d pos %u\n", slot, i, zoneId, mMetaZonePos[zoneId]);
+      debug_warn("meta zone: slot %p i %d zoneId %d\n", slot, i, zoneId);
+      assert(slot->available);
+      slot->available = false;
+      // both the dispatch thread and encoding thread use the meta zone list
+      // If the metadata zone is full, wait until RAIDController removes the
+      // zone from the list
+      Zone *metaZone = nullptr;
+      while (true) {
+        metaZone = mMetaZoneList[zoneId].front();
+        if (!metaZone->WillBeFull()) break; 
       }
+      assert(metaZone != nullptr);
+      auto metaZonePos = metaZone->GetIssuedPos();  
+//      if (metaZonePos % 32768 == 0) {
+//        debug_error("segment %lu slot %p i %d devId %d pos %u\n", 
+//          mSegmentMeta.segmentId, slot, i, zoneId, metaZonePos);
+//      }
       slot->append = true;
-      mOngoingMetaWrites++;
-      slot->zone = mMetaZones[zoneId];
-      mMetaZones[zoneId]->Write(mMetaZonePos[zoneId], unitSize, (void*)slot);
-      mMetaZonePos[zoneId] += unitSize / blockSize;
-
-      // have correctness problems but it is ok for a prototype
-      if (mMetaZonePos[zoneId] == mMetaZones[zoneId]->GetLength()) {
-        mSegmentStatus = SEGMENT_METAZONE_PREPARE_RESET;
-      }
+      slot->zone = metaZone;
+      slot->zone->Write(metaZonePos, unitSize, (void*)slot);
     } else {
       slot->zone = mZones[zoneId];
       mZones[zoneId]->Write(zonePos, unitSize, slot);
@@ -1280,21 +1344,6 @@ void Segment::Reset(RequestContext *ctx)
   }
 }
 
-void Segment::ResetMetaZones() {
-  // reuse the reset contexts
-  mResetContext.resize(mSegmentMeta.n);
-  for (int i = 0; i < mSegmentMeta.n; ++i) {
-    RequestContext *context = &mResetContext[i];
-    context->Clear();
-    context->ctrl = mRaidController;
-    context->segment = this;
-    context->type = STRIPE_UNIT;
-    context->status = RESET_REAPING;
-    context->available = false;
-    mMetaZones[i]->Reset(context);
-  }
-}
-
 bool Segment::IsResetDone()
 {
   bool done = true;
@@ -1328,20 +1377,6 @@ void Segment::Seal()
   printf("Seal segment ID %u, usage %u/%u = %.2lf, index blocks %u\n", 
       GetSegmentId(), mNumBlocks, mDataRegionSize * 3, 
       (double)mNumBlocks / (mDataRegionSize * 3), mNumIndexBlocks);
-
-  if (Configuration::GetSystemMode() == RAIZN_SIMPLE) {
-    mResetContext.resize(mSegmentMeta.n);
-    for (int i = 0; i < mSegmentMeta.n; ++i) {
-      RequestContext *context = &mResetContext[i];
-      context->Clear();
-      context->available = false;
-      context->ctrl = mRaidController;
-      context->segment = this;
-      context->type = STRIPE_UNIT;
-      context->status = FINISH_REAPING;
-      mMetaZones[i]->Seal(context);
-    }
-  }
 }
 
 void Segment::ReadStripe(RequestContext *ctx)
@@ -1475,6 +1510,7 @@ void Segment::ReadStripe(RequestContext *ctx)
 
 void Segment::WriteComplete(RequestContext *slot)
 {
+  debug_warn("slot->curOffset %u slot->size %u\n", slot->curOffset, slot->size);
   if (slot->offset < mHeaderRegionSize ||
       slot->offset >= mHeaderRegionSize + mDataRegionSize) {
     return;
@@ -1567,12 +1603,16 @@ void Segment::WriteComplete(RequestContext *slot)
 
   // update the write offset
   slot->curOffset = slot->size / blockSize;
+}
 
-  if (isParity) {
-    if (mOngoingMetaWrites > 0) {
-      mOngoingMetaWrites--;
-    }
-  }
+void Segment::RaiznWriteComplete() {
+  if (mOngoingRaiznWrites <= 0) {
+    debug_warn("mOngoingRaiznWrites %d\n", mOngoingRaiznWrites);
+    return;
+//    debug_error("mOngoingRaiznWrites %d\n", mOngoingRaiznWrites);
+//    assert(0);
+  } 
+  mOngoingRaiznWrites--;
 }
 
 void Segment::ReadComplete(RequestContext *slot)

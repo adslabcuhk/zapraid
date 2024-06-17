@@ -24,6 +24,7 @@ std::string gAccessTrace = "";
 uint32_t gTestGc = 0; // 0: fill
 bool gTestMode = false;
 bool gUseLbaLock = false;
+bool gHybridSize = false;
 // 150GiB WSS for GC test
 uint64_t gWss = 150ull * 1024 * 1024 * 1024 / Configuration::GetBlockSize(); 
 uint64_t gTrafficSize = 1ull * 1024 * 1024 * 1024 * 1024;
@@ -370,6 +371,9 @@ void testGc() {
   while (writtenBytes < gTrafficSize) {
     // will change the size later
     uint32_t size = gRequestSize; // (rand() % 8 + 1) * blockSize; 
+    if (gHybridSize && rand() % 4 == 3) {
+      size *= 4; // hybrid 75% 4-KiB writes and 25% 16-KiB writes 
+    }
     uint64_t lba;
     if (gSequential) {
       lba = (lastLba + gRequestSize / blockSize) % gWss;
@@ -561,6 +565,9 @@ int main(int argc, char *argv[])
       case 'l':
         gUseLbaLock = true;
         break;
+      case 'y':
+        gHybridSize = true;
+        break;
       default:
         fprintf(stderr, "Unknown option %c\n", opt);
         break;
@@ -603,6 +610,14 @@ int main(int argc, char *argv[])
       groupSizes[1] = groupSizes[2] = groupSizes[3] = 1;
       unitSizes[0] = 8192; 
       unitSizes[1] = unitSizes[2] = unitSizes[3] = 16384;
+    }
+
+    // special. 8*4+16*2 
+    if (gNumOpenSegments == 6 && gChunkSize == 4096 * 6) {
+      groupSizes[1] = groupSizes[2] = groupSizes[3] = groupSizes[4] =
+        groupSizes[5] = 1;
+      unitSizes[0] = unitSizes[1] = unitSizes[2] = unitSizes[3] = 8192; 
+      unitSizes[4] = unitSizes[5] = 16384;
     }
     for (int i = 0; i < Configuration::GetNumOpenSegments(); ++i) {
       paritySizes[i] = unitSizes[i];

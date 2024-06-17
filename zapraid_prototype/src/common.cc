@@ -86,6 +86,7 @@ void RequestContext::Clear()
   cb_args = nullptr;
   curOffset = 0;
   ioOffset = 0;
+  status = WRITE_COMPLETE; // added for clean operation
 
   timestamp = ~0ull;
 
@@ -443,6 +444,9 @@ bool StripeWriteContextPool::checkStripeAvailable(StripeWriteContext *stripe) {
   if (isAvailable) {
     for (auto slot : stripe->ioContext) {
       rPool->ReturnRequestContext(slot);
+    }
+    if (stripe->successBytes != stripe->targetBytes + stripe->metaTargetBytes) {
+      debug_error("no... %u != %u + %u\n", stripe->successBytes, stripe->targetBytes, stripe->metaTargetBytes);
     }
     stripe->ioContext.clear();
   }

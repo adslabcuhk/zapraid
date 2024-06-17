@@ -331,6 +331,15 @@ private:
   std::atomic<uint64_t> mNumIndexWritesHandled = 0;
   std::atomic<uint64_t> mNumIndexReadsHandled = 0;
 
+  // for RAIZN: metadata zones organization
+  std::vector<std::list<Zone*>> mMetazones;
+  // meta zones whose remaining in-flight writes can fill the zone
+  // i.e., meta zones whose WillBeFull() returns true
+  std::map<uint32_t, Zone*> mWritingMetaZones;
+  // meta zones that are reseting 
+  std::map<uint32_t, Zone*> mResettingMetaZones;
+  std::vector<RequestContext> mResetMetaZoneContexts;
+
   std::unordered_set<RequestContext*> mReadsInCurrentGcEpoch;
 };
 
